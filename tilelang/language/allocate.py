@@ -27,7 +27,7 @@ from tvm.tir.expr import FloatImm, IntImm
 from . import dtypes as _dtypes
 from .dtypes import dtype as tl_dtype
 from .eager.builder import OutTensor
-from .proxy import Tensor
+from .proxy import Tensor, ptr as _ptr_sentinel
 
 
 def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
@@ -132,6 +132,9 @@ def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | in
     if not isinstance(parsed_scope, str):
         raise TypeError("Scope must be a string in alloc_var.")
 
+    if dtype is _ptr_sentinel:
+        dtype = _dtypes.int64
+
     buffer = T.alloc_buffer([1], dtype, scope=parsed_scope)
     if parsed_init is not None:
         if isinstance(parsed_init, (int, float, IntImm, FloatImm)):
@@ -189,6 +192,25 @@ def alloc_cluster_barrier(arrive_count: int | list[int]) -> Buffer:
     arrive_count_exprs = [IntImm("int32", c) for c in arrive_count]
     block_attr({"barrier_init": {buffer.data: arrive_count_exprs}})
 
+    return buffer
+
+
+def alloc_maca_barrier(shape: ShapeType = 1) -> Buffer:
+    """Allocate a MACA barrier buffer.
+
+    Args:
+        shape (tuple): The shape of the barrier to allocate. Defaults to 1.
+
+    Returns:
+        T.Buffer: A TVM buffer object allocated for MACA barrier handles.
+
+    Examples
+    --------
+    >>> bar = alloc_maca_barrier(4)  # allocate 4 barrier handles for pipelining
+    >>> T.maca_async_copy(A[...], A_shared, barrier=bar[i])  # assign barrier handle
+    >>> T.barrier_arrive_and_wait(bar[i])  # wait for barrier
+    """
+    buffer = T.alloc_buffer(shape, "void", scope="local.barrier")
     return buffer
 
 

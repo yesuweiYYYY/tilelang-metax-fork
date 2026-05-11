@@ -5,11 +5,10 @@ import tilelang.testing
 from tvm import DataType
 import tilelang.language as T
 from tilelang.intrinsics import get_swizzle_layout
-from tilelang.intrinsics.mma_macro_generator import (
+from tilelang.intrinsics.maca_mma_macro_generator import (
     TensorCoreIntrinEmitter,
 )
 from tilelang.transform import simplify_prim_func
-from tilelang.utils.tensor import map_torch_type
 
 tilelang.testing.set_random_seed(0)
 
@@ -88,7 +87,7 @@ def tl_matmul(
         micro_size_y,
     )
 
-    warp_size = 32
+    warp_size = 64
     threads = warp_size * (block_row_warps * block_col_warps)
     local_size_a = (micro_size_x * micro_size_k) // warp_size
     local_size_b = (micro_size_y * micro_size_k) // warp_size
@@ -190,9 +189,9 @@ def assert_tl_matmul_correctness(M, N, K, in_dtype, out_dtype, accum_dtype):
     # src_code is the generated cuda source
     assert src_code is not None
 
-    in_dtype = map_torch_type(in_dtype)
-    out_dtype = map_torch_type(out_dtype)
-    accum_dtype = map_torch_type(accum_dtype)
+    in_dtype = T.dtype(in_dtype).as_torch()
+    out_dtype = T.dtype(out_dtype).as_torch()
+    accum_dtype = T.dtype(accum_dtype).as_torch()
 
     if in_dtype in {torch.int8, torch.int32}:
         A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(in_dtype).cuda()
@@ -218,8 +217,6 @@ def assert_tl_matmul_correctness(M, N, K, in_dtype, out_dtype, accum_dtype):
     tilelang.testing.torch_assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(8, 0)
 def test_assert_tl_matmul_bfloat16():
     assert_tl_matmul_correctness(256, 256, 256, T.bfloat16, T.float32, T.float32)
 

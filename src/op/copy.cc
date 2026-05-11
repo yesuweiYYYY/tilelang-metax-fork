@@ -14,6 +14,7 @@
 #include "../transform/common/loop_fusion_utils.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
+#include "../transform/maca_memcpy_async_injector.h"
 #include "../transform/ptx_async_copy_injector.h"
 #include "utils.h"
 
@@ -48,139 +49,6 @@ PrimExpr GetCopyMbarPhaseExpr(const Map<String, ObjectRef> &annotations,
   }
   return phase;
 }
-
-// Rewrite scalar global->shared stores into ptx_cp_async calls.
-// This rewriter is applied before the global vectorize pass, so each generated
-// cp.async call starts with element-wise bytes and can be widened later.
-class CPAsyncStoreRewriter : public StmtMutator {
-public:
-  Stmt Rewrite(const Stmt &stmt) { return VisitStmt(stmt); }
-
-  bool RewriteSuccess() const {
-    return rewritten_any_store_ && !failed_on_shared_store_;
-  }
-
-private:
-  static bool IsZeroValue(const PrimExpr &e) {
-    if (auto *b = e.as<BroadcastNode>()) {
-      return IsZeroValue(b->value);
-    }
-    if (auto *f = e.as<FloatImmNode>()) {
-      return f->value == 0.0f;
-    }
-    if (auto *i = e.as<IntImmNode>()) {
-      return i->value == 0;
-    }
-    return false;
-  }
-
-  static const BufferLoadNode *
-  MatchZeroFillBufferLoad(const PrimExpr &value,
-                          Optional<PrimExpr> *predicate) {
-    if (const auto *load = value.as<BufferLoadNode>()) {
-      return load;
-    }
-
-    const auto *call = value.as<CallNode>();
-    if (!call || !call->op.same_as(builtin::if_then_else()) ||
-        !IsZeroValue(call->args[2])) {
-      return nullptr;
-    }
-
-    const BufferLoadNode *load =
-        MatchZeroFillBufferLoad(call->args[1], predicate);
-    if (load == nullptr) {
-      return nullptr;
-    }
-
-    // Nested zero-fill guards only permit issuing cp.async when every guard
-    // on the path to the load is true.
-    *predicate =
-        predicate->defined()
-            ? Optional<PrimExpr>(And(call->args[0], predicate->value()))
-            : Optional<PrimExpr>(call->args[0]);
-    return load;
-  }
-
-  Stmt VisitStmt_(const BufferStoreNode *op) final {
-    if (!IsSharedBuffer(op->buffer)) {
-      return StmtMutator::VisitStmt_(op);
-    }
-
-    Optional<PrimExpr> predicate = std::nullopt;
-    // Accept either a direct load or a nested zero-fill guard chain:
-    // if_then_else(p1, if_then_else(p2, load, 0), 0). Nested predicates are
-    // combined so the generated cp.async is only issued when all guards hold.
-    const BufferLoadNode *load = MatchZeroFillBufferLoad(op->value, &predicate);
-    if (load == nullptr) {
-      failed_on_shared_store_ = true;
-      return StmtMutator::VisitStmt_(op);
-    }
-
-    if (!IsGlobalBuffer(load->buffer)) {
-      failed_on_shared_store_ = true;
-      return StmtMutator::VisitStmt_(op);
-    }
-    int bytes = op->value.dtype().bytes();
-    int vectorized_lanes = current_vectorized_lanes_;
-
-    if (!IsValidCPAsyncTransferBytes(bytes * vectorized_lanes)) {
-      failed_on_shared_store_ = true;
-      return StmtMutator::VisitStmt_(op);
-    }
-
-    // Keep pointer metadata in tl.access_ptr form for downstream analysis;
-    // LowerAccessPtr will translate it to tvm_access_ptr later.
-    PrimExpr dst_access_ptr =
-        Call(DataType::Handle(), tvm::tl::access_ptr(),
-             {
-                 BufferLoad(op->buffer, op->indices),
-                 IntImm(DataType::Int(32), 1), // extent
-                 IntImm(DataType::Int(32), 2)  // rw_mask: write
-             });
-    PrimExpr src_access_ptr =
-        Call(DataType::Handle(), tvm::tl::access_ptr(),
-             {
-                 BufferLoad(load->buffer, load->indices),
-                 IntImm(DataType::Int(32), 1), // extent
-                 IntImm(DataType::Int(32), 1)  // rw_mask: read
-             });
-
-    Array<PrimExpr> args{dst_access_ptr, src_access_ptr, PrimExpr(bytes)};
-    if (predicate.defined()) {
-      args.push_back(predicate.value());
-    }
-    rewritten_any_store_ = true;
-    return Evaluate(Call(DataType::Handle(), builtin::ptx_cp_async(), args));
-  }
-
-  Stmt VisitStmt_(const ForNode *op) final {
-    int previous_vectorized_lanes = current_vectorized_lanes_;
-    if (op->kind == ForKind::kVectorized) {
-      // Assume vectorized access pattern is contiguous on the vectorized iter.
-      // This is guaranteed by tl.VectorizeLoop: if an access pattern is not
-      // vectorizable/contiguous for the chosen iter, it is scalarized instead
-      // of staying as ForKind::kVectorized.
-      const auto *extent_imm = op->extent.as<IntImmNode>();
-      ICHECK(extent_imm)
-          << "Vectorized loops must have constant extent, but got "
-          << op->extent;
-      int lanes = static_cast<int>(extent_imm->value);
-      if (lanes > 1 && current_vectorized_lanes_ <=
-                           std::numeric_limits<int>::max() / lanes) {
-        current_vectorized_lanes_ *= lanes;
-      }
-    }
-
-    Stmt stmt = StmtMutator::VisitStmt_(op);
-    current_vectorized_lanes_ = previous_vectorized_lanes;
-    return stmt;
-  }
-
-  bool rewritten_any_store_ = false;
-  bool failed_on_shared_store_ = false;
-  int current_vectorized_lanes_ = 1;
-};
 
 } // namespace
 
@@ -1000,6 +868,12 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     ICHECK(ldsm_copy.defined()) << "Failed to lower ptx matrix copy";
     return ldsm_copy;
   } else if (copy_inst == CopyInst::kCPAsync) {
+    if (TargetIsMaca(target)) {
+      auto memcpy_async_copy = LowerMACAMemcpyAsync(T, analyzer);
+      ICHECK(memcpy_async_copy.defined())
+          << "Failed to lower memcpy_async copy";
+      return memcpy_async_copy;
+    }
     auto cp_async_copy = LowerCPAsyncCopy(T, analyzer);
     ICHECK(cp_async_copy.defined()) << "Failed to lower cp.async copy";
     return cp_async_copy;
@@ -1086,6 +960,50 @@ Stmt CopyNode::LowerCPAsyncCopy(const LowerArgs &T,
     return SeqStmt({cp_async_loop, commit_group});
   }
   return cp_async_loop;
+}
+
+Stmt CopyNode::LowerMACAMemcpyAsync(const LowerArgs &T,
+                                    arith::Analyzer *analyzer) const {
+  using namespace tvm::transform;
+
+  PrimExpr mbar_handle;
+  if (auto user_barrier = annotations.Get("barrier")) {
+    mbar_handle = Downcast<PrimExpr>(user_barrier.value());
+  } else {
+    LOG(FATAL) << "T.maca_async_copy() requires a barrier argument. "
+               << "Use T.maca_async_copy(src, dst, barrier=bar).";
+  }
+
+  auto simt_loop = MakeSIMTLoop(analyzer);
+  auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
+  auto par_op = ParallelOp(fused_loop);
+
+  std::vector<InferLevel> levels = {InferLevel::kCommon, InferLevel::kStrict,
+                                    InferLevel::kFree};
+
+  for (auto level : levels) {
+    par_op->InferLayout({T.target,
+                         T.thread_bounds,
+                         T.layout_map,
+                         analyzer,
+                         false,
+                         T.buffer_remap,
+                         {}},
+                        level);
+  }
+  auto loop_layout = par_op->GetLoopLayout();
+  Stmt lowered_loop =
+      LowerParallelLoop(par_op->GetRoot(), loop_layout, T.thread_var, analyzer,
+                        T.layout_map, par_op->GetPredicate(T.thread_var));
+
+  auto inject_result = InjectMACAMemcpyAsync(lowered_loop, mbar_handle);
+  Stmt memcpy_async_loop = inject_result.stmt;
+  ICHECK(inject_result.injected_maca_memcpy_async)
+      << "maca_async_copy rewrite miss for copy src=" << src->name
+      << " (scope=" << src.scope() << ", dtype=" << src->dtype
+      << "), dst=" << dst->name << " (scope=" << dst.scope()
+      << ", dtype=" << dst->dtype << ")";
+  return memcpy_async_loop;
 }
 
 // Lowers the copy using standard load/store with loop transformations.
@@ -1295,9 +1213,10 @@ Stmt CopyNode::LowerLDSMCopy(const LowerArgs &T, arith::Analyzer *analyzer,
     shared_coords = inv->Forward({local_index, thread_index});
   }
   shared_coords.pop_back(); // remove rep
-  PrimExpr shared_addr = shared_tensor.access_ptr(
-      is_ldmatrix ? 1 : 2, DataType::Handle(), 1,
-      shared_tensor.OffsetOf(shared_coords).back(), PrimExpr(2 * num));
+  PrimExpr shared_addr =
+      Call(DataType::Handle(), tl::access_ptr(),
+           {BufferLoad(shared_tensor, shared_coords), PrimExpr(2 * num),
+            make_const(DataType::Int(32), is_ldmatrix ? 1 : 2)});
   args.push_back(shared_addr);
 
   if (is_ldmatrix) {
@@ -1307,8 +1226,10 @@ Stmt CopyNode::LowerLDSMCopy(const LowerArgs &T, arith::Analyzer *analyzer,
       // copy
       return LowerNormalCopy(T, analyzer);
     }
-    PrimExpr local_addr = local_tensor.access_ptr(
-        2, DataType::Handle(), 1, local_iter * 2 * num, PrimExpr(2 * num));
+    PrimExpr local_addr =
+        Call(DataType::Handle(), tl::access_ptr(),
+             {BufferLoad(local_tensor, {local_iter * 2 * num}),
+              PrimExpr(2 * num), make_const(DataType::Int(32), 2)});
     args.push_back(local_addr);
   } else {
     for (int i = 0; i < num; i++) {
@@ -2493,6 +2414,22 @@ TVM_REGISTER_OP("tl.tileop.tma_copy")
                                 Map<String, ObjectRef> annotations) {
                                Map<String, ObjectRef> ann = annotations;
                                ann.Set("is_tma_copy",
+                                       IntImm(DataType::Int(32), 1));
+                               return Copy(args, ann);
+                             })
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+// Register the maca_async_copy operation - for MACA async copy using
+// memcpy_async and barrier_arrive_and_wait.
+TVM_REGISTER_OP("tl.tileop.maca_async_copy")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "maca_async_copy")
+    .set_attr<OpBuilderFunc>("TLOpBuilder",
+                             [](Array<PrimExpr> args,
+                                Map<String, ObjectRef> annotations) {
+                               Map<String, ObjectRef> ann = annotations;
+                               ann.Set("is_async_copy",
                                        IntImm(DataType::Int(32), 1));
                                return Copy(args, ann);
                              })

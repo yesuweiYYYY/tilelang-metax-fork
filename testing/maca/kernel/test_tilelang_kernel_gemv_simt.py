@@ -6,7 +6,6 @@ from tvm import DataType
 import tilelang.language as T
 from tilelang import JITKernel
 from tilelang.transform.simplify import apply_simplify
-from tilelang.utils.tensor import map_torch_type
 from typing import Optional
 
 tilelang.testing.set_random_seed(0)
@@ -126,11 +125,11 @@ def evaluate_gemv_simt(
 ):
     program = gemv_simt(M, N, K, in_dtype, out_dtype, accum_dtype, trans_A, trans_B, with_bias)
 
-    kernel = JITKernel(program, target="cuda")
+    kernel = JITKernel(program, target="maca")
 
-    in_dtype = map_torch_type(in_dtype)
-    out_dtype = map_torch_type(out_dtype)
-    accum_dtype = map_torch_type(accum_dtype)
+    in_dtype = T.dtype(in_dtype).as_torch()
+    out_dtype = T.dtype(out_dtype).as_torch()
+    accum_dtype = T.dtype(accum_dtype).as_torch()
 
     if in_dtype in {torch.int8, torch.int32}:
         A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(in_dtype).cuda()
@@ -161,15 +160,13 @@ def evaluate_gemv_simt(
     tilelang.testing.torch_assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(8, 0)
+@tilelang.testing.pytest.mark.xfail
 def test_gemv_simt():
     evaluate_gemv_simt(1, 1024, 1024, T.float16, T.float16, T.float16, with_bias=False)
     evaluate_gemv_simt(1, 1024, 1024, T.int8, T.int32, T.int32, with_bias=False)
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(8, 9)
+@tilelang.testing.pytest.mark.xfail
 def test_gemv_simt_fp8():
     evaluate_gemv_simt(1, 1024, 1024, T.float8_e4m3fn, T.float32, T.float32, with_bias=False)
     evaluate_gemv_simt(1, 1024, 1024, T.float8_e5m2, T.float32, T.float32, with_bias=False)

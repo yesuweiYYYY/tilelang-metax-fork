@@ -317,11 +317,12 @@ std::string CodeGenTileLangMACA::Finish() {
     decl_stream << "#include <tl_templates/maca/gemm_sp.h>\n";
   }
   // TODO: Add implementation for maca target.
-  // decl_stream << "#include <tl_templates/maca/copy.h>\n";
+  decl_stream << "#include <tl_templates/maca/copy.h>\n";
   decl_stream << "#include <tl_templates/maca/reduce.h>\n";
-  decl_stream << "#include <tl_templates/maca/threadblock_swizzle.h>\n";
+  decl_stream << "#include <tl_templates/maca/intrin.h>\n";
   decl_stream << "#include <tl_templates/maca/atomic.h>\n";
-  // decl_stream << "#include <tl_templates/maca/debug.h>\n";
+  decl_stream << "#include <tl_templates/maca/threadblock_swizzle.h>\n";
+  decl_stream << "#include <tl_templates/maca/debug.h>\n";
   //  decl_stream << "#ifdef ENABLE_BF16\n";
   //  decl_stream << "#include <tl_templates/maca/maca_bf16_fallbacks.cuh>\n";
   //  decl_stream << "#endif\n";
@@ -1488,7 +1489,7 @@ std::string CodeGenTileLangMACA::GetVecLoad(DataType t,
       << "Unsupported vector load size: " << t.bits() * t.lanes();
   auto buffer_ref = this->GetBufferRef(t, buffer, base);
   std::ostringstream os;
-  os << "tl::ld_global_256(&(" << buffer_ref << "))";
+  os << "tl::load_global_256(&(" << buffer_ref << "))";
   return os.str();
 }
 
@@ -1512,7 +1513,7 @@ void CodeGenTileLangMACA::PrintVecStore(const BufferNode *buffer, DataType t,
       << "Unsupported vector load size: " << t.bits() * t.lanes();
   auto buffer_ref = this->GetBufferRef(t, buffer, base);
   this->PrintIndent();
-  this->stream << "tl::st_global_256(&(" << buffer_ref << "), " << value
+  this->stream << "tl::store_global_256(&(" << buffer_ref << "), " << value
                << ");\n";
 }
 
@@ -1566,56 +1567,28 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->stream << ss.str();
     this->stream << ");\n";
   };
-  if (op->op.same_as(builtin::ptx_cp_async())) {
+  if (op->op.same_as(tl::maca_memcpy_async())) {
     // args[0] = dst_access_ptr, args[1] = src_access_ptr, args[2] = bytes,
-    // args[3] = predicate (optional)
-    ICHECK(op->args.size() == 3 || op->args.size() == 4)
-        << "ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-           "src_access_ptr, bytes, [predicate])";
+    // args[3] = barrier
+    ICHECK(op->args.size() == 4)
+        << "maca_memcpy_async expects 4 arguments (dst_access_ptr, "
+           "src_access_ptr, bytes, barrier)";
 
     std::string dst = this->PrintExpr(op->args[0]);
     std::string src = this->PrintExpr(op->args[1]);
-    std::string size = this->PrintExpr(op->args[2]);
+    std::string bytes = this->PrintExpr(op->args[2]);
+    std::string mbar = this->PrintExpr(op->args[3]);
 
     this->PrintIndent();
-    if (op->args.size() == 3) {
-      // Non-predicated version
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
-                   << ");\n";
-    } else {
-      // Predicated version
-      std::string condition = this->PrintExpr(op->args[3]);
-      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
-                   << ", " << src << ", " << condition << ");\n";
-    }
-  } else if (op->op.same_as(tl::ptx_cp_async())) {
-    // TileLang version: args[0] = dst_access_ptr, args[1] = src_access_ptr,
-    // args[2] = bytes, args[3] = predicate (optional)
-    ICHECK(op->args.size() == 3 || op->args.size() == 4)
-        << "tl::ptx_cp_async expects 3 or 4 arguments (dst_access_ptr, "
-           "src_access_ptr, bytes, [predicate])";
-
-    std::string dst = this->PrintExpr(op->args[0]);
-    std::string src = this->PrintExpr(op->args[1]);
-    std::string size = this->PrintExpr(op->args[2]);
-
+    this->stream << mbar << " = memcpy_async<" << bytes
+                 << ">((void* __restrict__)" << dst << ", (void* __restrict__)"
+                 << src << ");\n";
+  } else if (op->op.same_as(tl::maca_barrier_arrive_and_wait())) {
     this->PrintIndent();
-    if (op->args.size() == 3) {
-      // Non-predicated version
-      this->stream << "tl::cp_async_gs<" << size << ">(" << dst << ", " << src
-                   << ");\n";
-    } else {
-      // Predicated version
-      std::string condition = this->PrintExpr(op->args[3]);
-      this->stream << "tl::cp_async_gs_conditional<" << size << ">(" << dst
-                   << ", " << src << ", " << condition << ");\n";
-    }
-  } else if (op->op.same_as(builtin::ptx_commit_group())) {
-    print_extern_call_stmt("tl::cp_async_commit");
-  } else if (op->op.same_as(builtin::ptx_wait_group())) {
-    int n = Downcast<IntImm>(op->args[0])->value;
-    std::string func_name = "tl::cp_async_wait<" + std::to_string(n) + ">";
-    print_extern_call_stmt(func_name, 1);
+    ICHECK(op->args.size() == 1)
+        << "maca_barrier_arrive_and_wait expects 1 argument (bar)";
+    std::string dummyRet = this->PrintExpr(op->args[0]);
+    this->stream << "barrier_arrive_and_wait(" << dummyRet << ");\n";
   } else if (op->op.same_as(builtin::create_barriers())) {
     this->PrintIndent();
     int barrier_count = Downcast<IntImm>(op->args[0])->value;
@@ -1808,6 +1781,13 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->need_cooperative_groups_ = true;
     this->PrintIndent();
     this->stream << "cooperative_groups::this_grid().sync();\n";
+  } else if (op->op.same_as(tl::sync_warp())) {
+    this->PrintIndent();
+    this->stream << "__syncwarp(";
+    if (!op->args.empty()) {
+      this->stream << this->PrintExpr(op->args[0]);
+    }
+    this->stream << ");\n";
   } else if (op->op.same_as(tl::loop_break())) {
     this->PrintIndent();
     this->stream << "break;\n";
@@ -1911,11 +1891,20 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
         {"float32", "float"},
         {"float64", "double"},
         {"float16x4", "float16x4"},
+        {"float16x8", "float16x8"},
         {"bfloat16x4", "bfloat16x4_vec"},
+        {"bfloat16x8", "bfloat16x8_vec"},
         {"float32x4", "float32x4"},
-        {"float8_e4m3fnuzx4", "fp8_e4_4_t"},
-        {"float8_e4m3fnuzx8", "long"},
-        {"float32x16", "float32x16"}};
+        {"float8_e4m3fnuzx4", "int32x2"},
+        {"float8_e4m3fnx4", "int32x2"},
+        {"float8_e4m3fnuzx8", "int32x2"},
+        {"float8_e4m3fnx8", "int32x2"},
+        {"float8_e5m2fnuzx4", "fp8_e5_4_t"},
+        {"float8_e5m2fnuzx8", "int32x2"},
+        {"float8_e5m2x4", "fp8_e5_4_t"},
+        {"float8_e5m2x8", "int32x2"},
+        {"float32x16", "float32x16"},
+        {"float32x32", "float32x32"}};
     std::string call_mfma_code = R"({
       *((({C_dtype}*){c_ref}) + {c_bias}) = {mfma_buildin}(*((({A_dtype}*){a_ref}) + {a_bias}),
                     *((({B_dtype}*){b_ref}) + {b_bias}),
@@ -2102,9 +2091,15 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     if (this->mcrand_random_generator_state_type ==
         "curandStatePhilox4_32_10_t") {
       this->mcrand_random_generator_state_type = "mcrandStatePhilox4_32_10_t";
+    } else if (this->mcrand_random_generator_state_type ==
+               "curandStateMRG32k3a_t") {
+      this->mcrand_random_generator_state_type = "mcrandStateMRG32k3a_t";
+    } else if (this->mcrand_random_generator_state_type ==
+               "curandStateXORWOW_t") {
+      this->mcrand_random_generator_state_type = "mcrandStateXORWOW_t";
     }
     this->PrintIndent();
-    this->stream << this->mcrand_random_generator_state_type
+    this->stream << this->mcrand_random_generator_state_type << " "
                  << this->mcrand_random_generator_state << ";\n";
     this->PrintIndent();
     this->stream << "mcrand_init(" << PrintExpr(op->args[0]) << ", "
@@ -2218,6 +2213,18 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
       this->stream << ", " << PrintExpr(op->args[2]);
     }
     this->stream << ");\n";
+  } else if (op->op.same_as(tl::atomic_load_elem_op())) {
+    // atomic_load_elem_op(src_ptr, memory_order) -> returns loaded value
+    os << "AtomicLoad(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::atomic_store_elem_op())) {
+    // atomic_store_elem_op(dst_ptr, value, memory_order)
+    std::string dst_ptr = PrintExpr(op->args[0]);
+    std::string value = PrintExpr(op->args[1]);
+    std::string memory_order = PrintExpr(op->args[2]);
+    this->PrintIndent();
+    this->stream << "AtomicStore(" << dst_ptr << ", " << value << ", "
+                 << memory_order << ");\n";
   } else if (op->op.same_as(tl::atomic_max_elem_op())) {
     // atomic_max_elem_op(dst_ptr, src_value[, memory_order])
     std::string dst_ptr = PrintExpr(op->args[0]);
@@ -2258,6 +2265,8 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
       os << ", " << PrintExpr(op->args[2]);
     }
     os << ")";
+  } else if (op->op.same_as(builtin::thread_return())) {
+    os << "return";
   } else if (op->op.same_as(tl::tl_gemm_sp())) {
     ICHECK(op->args.size() == 5)
         << "tl_gemm_sp expects 5 arguments <op_instance, A_ptr, B_ptr, C_ptr, "
@@ -2267,6 +2276,67 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     enable_sparse_gemm_ = true;
     this->PrintCallExtern(GetType(tvm::ffi::GetRef<PrimExpr>(op)),
                           op_instance->value, op->args, true, os);
+  } else if (op->op.same_as(tl::shfl_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_sync expects <mask, value, src_lane, width>.";
+    os << "__shfl_sync(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ", "
+       << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_xor_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_xor_sync expects <mask, value, lane_mask, width>.";
+    os << "__shfl_xor_sync(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ", "
+       << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_down_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_down_sync expects <mask, value, delta, width>.";
+    os << "__shfl_down_sync(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ", "
+       << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::shfl_up_sync())) {
+    ICHECK_EQ(op->args.size(), 4U)
+        << "tl.shfl_up_sync expects <mask, value, delta, width>.";
+    os << "__shfl_up_sync(" << PrintExpr(op->args[0]) << ", "
+       << PrintExpr(op->args[1]) << ", " << PrintExpr(op->args[2]) << ", "
+       << PrintExpr(op->args[3]) << ")";
+  } else if (op->op.same_as(tl::get_lane_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_lane_idx expects at most one argument <warp_size>.";
+    os << "tl::get_lane_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_idx_sync())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_warp_idx_sync expects at most one argument <warp_size>.";
+    os << "tl::get_warp_idx_sync(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_idx())) {
+    ICHECK_LE(op->args.size(), 1)
+        << "tl.get_warp_idx expects at most one argument <warp_size>.";
+    os << "tl::get_warp_idx(";
+    if (!op->args.empty()) {
+      os << PrintExpr(op->args[0]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::get_warp_group_idx())) {
+    ICHECK_LE(op->args.size(), 2)
+        << "tl.get_warp_group_idx expects <warp_size, warps_per_group>.";
+    os << "tl::get_warp_group_idx(";
+    for (size_t i = 0; i < op->args.size(); ++i) {
+      if (i != 0) {
+        os << ", ";
+      }
+      os << PrintExpr(op->args[i]);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::tl_shuffle_elect())) {
+    os << "tl::tl_shuffle_elect<" << PrintExpr(op->args[0]) << ">()";
   } else if (op->op.same_as(Op::Get("tir.exp"))) {
     MACAMath math_func;
     std::string func_name = math_func(op->dtype, "exp");
@@ -2379,6 +2449,154 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string func_name = math_func(op->dtype, "fdiv", rounding_mode);
     os << func_name << "(" << PrintExpr(op->args[0]) << ", "
        << PrintExpr(op->args[1]) << ")";
+  } else if (op->op.same_as(tl::__ldg())) {
+    // Explicit read-only cached load. Preferred form: __ldg(BufferLoad(...)).
+    const BufferLoadNode *bl = nullptr;
+    if (!op->args.empty()) {
+      bl = op->args[0].as<BufferLoadNode>();
+    }
+    if (bl == nullptr) {
+      LOG(FATAL) << "T.__ldg expects a BufferLoad as the first argument.";
+    }
+    const BufferNode *buffer = bl->buffer.get();
+    ICHECK_EQ(bl->indices.size(), 1)
+        << "T.__ldg currently supports flattened 1D buffer accesses.";
+    PrimExpr base = bl->indices[0];
+    // Emit __ldg(&buffer_ref)
+    auto buffer_ref = this->GetBufferRef(op->dtype, buffer, base);
+    os << "__ldg(&(" << buffer_ref << "))";
+  } else if (op->op.same_as(tl::ldg32())) {
+    // Explicit 32-bit global memory load: load_global_32(ptr) or
+    // load_global_32_conditional(ptr, pred)
+    ICHECK(!op->args.empty()) << "T.ldg32 expects a pointer argument.";
+    if (op->args.size() > 1) {
+      os << "tl::load_global_32_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    } else {
+      os << "tl::load_global_32(";
+      this->PrintExpr(op->args[0], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::ldg64())) {
+    // Explicit 64-bit global memory load: load_global_64(ptr) or
+    // load_global_64_conditional(ptr, pred)
+    ICHECK(!op->args.empty()) << "T.ldg64 expects a pointer argument.";
+    if (op->args.size() > 1) {
+      os << "tl::load_global_64_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    } else {
+      os << "tl::load_global_64(";
+      this->PrintExpr(op->args[0], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::ldg128())) {
+    // Explicit 128-bit global memory load: load_global_128(ptr) or
+    // load_global_128_conditional(ptr, pred)
+    ICHECK(!op->args.empty()) << "T.ldg128 expects a pointer argument.";
+    if (op->args.size() > 1) {
+      os << "tl::load_global_128_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    } else {
+      os << "tl::load_global_128(";
+      this->PrintExpr(op->args[0], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::ldg256())) {
+    // Explicit 256-bit global memory load: load_global_256(ptr) or
+    // load_global_256_conditional(ptr, pred)
+    ICHECK(!op->args.empty()) << "T.ldg256 expects a pointer argument.";
+    if (op->args.size() > 1) {
+      os << "tl::load_global_256_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    } else {
+      os << "tl::load_global_256(";
+      this->PrintExpr(op->args[0], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::stg32())) {
+    // Explicit 32-bit global memory store: store_global_32(ptr, value) or
+    // store_global_32_conditional(ptr, value, pred)
+    ICHECK(op->args.size() >= 2)
+        << "T.stg32 expects pointer and value arguments.";
+    if (op->args.size() > 2) {
+      os << "tl::store_global_32_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+      os << ", ";
+      this->PrintExpr(op->args[2], os);
+    } else {
+      os << "tl::store_global_32(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::stg64())) {
+    // Explicit 64-bit global memory store: store_global_64(ptr, value) or
+    // store_global_64_conditional(ptr, value, pred)
+    ICHECK(op->args.size() >= 2)
+        << "T.stg64 expects pointer and value arguments.";
+    if (op->args.size() > 2) {
+      os << "tl::store_global_64_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+      os << ", ";
+      this->PrintExpr(op->args[2], os);
+    } else {
+      os << "tl::store_global_64(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::stg128())) {
+    // Explicit 128-bit global memory store: store_global_128(ptr, value) or
+    // store_global_128_conditional(ptr, value, pred)
+    ICHECK(op->args.size() >= 2)
+        << "T.stg128 expects pointer and value arguments.";
+    if (op->args.size() > 2) {
+      os << "tl::store_global_128_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+      os << ", ";
+      this->PrintExpr(op->args[2], os);
+    } else {
+      os << "tl::store_global_128(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    }
+    os << ")";
+  } else if (op->op.same_as(tl::stg256())) {
+    // Explicit 256-bit global memory store: store_global_256(ptr, value) or
+    // store_global_256_conditional(ptr, value, pred)
+    ICHECK(op->args.size() >= 2)
+        << "T.stg256 expects pointer and value arguments.";
+    if (op->args.size() > 2) {
+      os << "tl::store_global_256_conditional(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+      os << ", ";
+      this->PrintExpr(op->args[2], os);
+    } else {
+      os << "tl::store_global_256(";
+      this->PrintExpr(op->args[0], os);
+      os << ", ";
+      this->PrintExpr(op->args[1], os);
+    }
+    os << ")";
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -2481,6 +2699,9 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
     stream << "tl::Tcgen05SMemDescriptor " << vid << ";\n";
   } else if (scope == "local.descriptor.tcgen05_instr") {
     stream << "tl::Tcgen05InstrDescriptor " << vid << ";\n";
+  } else if (scope == "local.barrier") {
+    ICHECK(op->annotations.count("barrier_type"));
+    stream << Downcast<StringImm>(op->annotations.at("barrier_type"))->value;
   } else {
     PrintStorageScope(scope, stream);
     PrintType(op->dtype, stream);
@@ -2522,6 +2743,8 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocateNode *op) {
         init = user_init;
       }
       stream << ' ' << vid << " = " << PrintExpr(init) << ";\n";
+    } else if (scope == "local.barrier") {
+      stream << ' ' << vid << '[' << constant_size << "];\n";
     } else if (scope.find("local.descriptor") != 0) {
       ICHECK(false) << "Unsupported scope: " << scope;
     }
@@ -2825,7 +3048,8 @@ void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4) {
     bool fail = false;
     const int64_t *p = as_const_int(op->value);
-    ICHECK(p);
+    ICHECK(p) << "BroadcastNode " << op << " value: " << op->value
+              << " is not a constant";
     int64_t v = *p & 0xF;
 
     if (lanes == 4) {

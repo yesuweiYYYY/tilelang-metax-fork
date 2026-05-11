@@ -443,8 +443,8 @@ TVM_DLL const Op &ptx_cp_async_barrier_noinc();
 /*!
  * \brief TileLang intrinsic for PTX async copy from global to shared memory
  *
- * ptx_cp_async(dst_access_ptr, src_access_ptr, bytes)
- * ptx_cp_async(dst_access_ptr, src_access_ptr, bytes, predicate)
+ * ptx_cp_async(dst_access_ptr, src_access_ptr, num_elems)
+ * ptx_cp_async(dst_access_ptr, src_access_ptr, num_elems, predicate)
  *
  */
 TVM_DLL const Op &ptx_cp_async();
@@ -1188,6 +1188,16 @@ TVM_DLL const Op &stg128();
  *    T.stg256(y, i, value)
  */
 TVM_DLL const Op &stg256();
+
+/*!
+ * \brief tilelang intrinsic for MACA memory async copy.
+ */
+TVM_DLL const Op &maca_memcpy_async();
+
+/*!
+ * \brief tilelang intrinsic for MACA barrier arrive and wait.
+ */
+TVM_DLL const Op &maca_barrier_arrive_and_wait();
 
 } // namespace tl
 } // namespace tvm

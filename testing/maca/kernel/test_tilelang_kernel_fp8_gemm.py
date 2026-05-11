@@ -1,7 +1,6 @@
 import torch
 import tilelang.testing
 import tilelang.language as T
-from tilelang.utils.tensor import map_torch_type
 
 
 def calc_diff(x, y):
@@ -38,12 +37,12 @@ def assert_matmul_correctness(M, N, K, block_M, block_N, block_K, in_dtype, out_
     func = matmul_nt(M, N, K, block_M, block_N, block_K, in_dtype, out_dtype, accum_dtype)
     kernel = tilelang.compile(func, out_idx=-1)
 
-    A = torch.randn(M, K).to(map_torch_type(in_dtype)).cuda()
-    B = torch.randn(N, K).to(map_torch_type(in_dtype)).cuda()
+    A = torch.randn(M, K).to(T.dtype(in_dtype).as_torch()).cuda()
+    B = torch.randn(N, K).to(T.dtype(in_dtype).as_torch()).cuda()
 
     C = kernel(A, B)
 
-    ref_c = torch.matmul(A.to(map_torch_type(accum_dtype)), B.T.to(map_torch_type(accum_dtype))).to(map_torch_type(out_dtype))
+    ref_c = torch.matmul(A.to(T.dtype(accum_dtype).as_torch()), B.T.to(T.dtype(accum_dtype).as_torch())).to(T.dtype(out_dtype).as_torch())
     print(C)
     print(ref_c)
     diff = calc_diff(C, ref_c)
@@ -51,8 +50,6 @@ def assert_matmul_correctness(M, N, K, block_M, block_N, block_K, in_dtype, out_
     assert diff < 1e-3
 
 
-@tilelang.testing.requires_cuda
-@tilelang.testing.requires_cuda_compute_version(9)
 def test_assert_matmul():
     assert_matmul_correctness(1024, 1024, 1024, 128, 128, 64, T.float8_e4m3fn, T.float32, T.float32)
     assert_matmul_correctness(1024, 1024, 1024, 128, 128, 64, T.float8_e5m2, T.float32, T.float32)

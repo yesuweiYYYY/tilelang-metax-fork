@@ -4,7 +4,6 @@ import torch
 import tilelang.testing
 import tilelang
 import tilelang.language as T
-from tilelang.utils.tensor import map_torch_type
 
 tilelang.testing.set_random_seed(42)
 
@@ -61,7 +60,7 @@ def tl_gemm(
             T.clear(C_local)
             T.clear(C_local_accum)
             K_iters = T.ceildiv(K, block_K)
-            for k in T.Pipelined(K_iters, num_stages=4):
+            for k in T.Pipelined(K_iters, num_stages=1):
                 # Load A into shared memory
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 # Load B into shared memory
@@ -148,9 +147,9 @@ def assert_tl_gemm_correctness(M, N, K, block_N, in_dtype, out_dtype, accum_dtyp
     # src_code is the generated cuda source
     assert src_code is not None
 
-    in_dtype = map_torch_type(in_dtype)
-    out_dtype = map_torch_type(out_dtype)
-    accum_dtype = map_torch_type(accum_dtype)
+    in_dtype = in_dtype.as_torch()
+    out_dtype = out_dtype.as_torch()
+    accum_dtype = accum_dtype.as_torch()
 
     A = torch.randn(M, K).to(torch.bfloat16).cuda()
     B = torch.randn(N, K).to(torch.bfloat16).cuda()
